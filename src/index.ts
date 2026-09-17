@@ -131,6 +131,13 @@ discordClient.on(Events.InteractionCreate, async i => {
 
 discordClient.on(Events.MessageCreate, async m => {
     if (m.author.bot || m.channel.isDMBased()) return;
+
+    // Ungated health check - no DB/permission gate, confirms the bot is receiving and responding to messages.
+    if (m.content === "bb.ping") {
+        await m.reply("pong");
+        return;
+    }
+
     if (m.guild?.id !== "729343895720165377" && m.author.id !== "105408136285818880") return;
 
     if (
