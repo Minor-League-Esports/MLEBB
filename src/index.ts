@@ -4,7 +4,7 @@ config();
 
 import {compareAsc, format, parseISO} from "date-fns";
 import {utcToZonedTime, zonedTimeToUtc} from "date-fns-tz";
-import {ButtonStyle, ComponentType, Events} from "discord.js";
+import {AttachmentBuilder, ButtonStyle, ComponentType, Events} from "discord.js";
 
 import {discordClient, pgClient} from "./clients";
 import type {EpicProfile} from "./epic";
@@ -12,6 +12,14 @@ import {bcToXboxId, EpicService, xboxIdToBC} from "./epic";
 import {sheets} from "./google";
 import {exclude, include} from "./roles";
 import {RetentionOption, retentionOptions} from "./types";
+
+const ADMIN_IDS = [
+    "105408136285818880",
+    "458513869384450070",
+    "256991987163463680",
+    "765878889150283776",
+    "165656556568838144",
+];
 
 discordClient
     .login(process.env.TOKEN)
@@ -131,13 +139,42 @@ discordClient.on(Events.InteractionCreate, async i => {
 
 discordClient.on(Events.MessageCreate, async m => {
     if (m.author.bot || m.channel.isDMBased()) return;
-    if (m.guild?.id !== "729343895720165377" && m.author.id !== "105408136285818880") return;
+
+    // Ungated health check - no DB/permission gate, confirms the bot is receiving and responding to messages.
+    if (m.content === "bb.ping") {
+        await m.reply("pong");
+        return;
+    }
+
+    // Ungated command list - no DB/permission gate, so any user can see what's available.
+    if (m.content === "bb.help") {
+        await m.reply({
+            embeds: [
+                {
+                    color: 0xeec707,
+                    title: "MLEBB Commands",
+                    description: [
+                        "`bb.ping` - health check, replies \"pong\". No permissions required.",
+                        "`bb.help` - shows this list. No permissions required.",
+                        "`bb.list` - reports role/nickname changes that would be made, without applying them. Admin/leadership role required.",
+                        "`bb.fix` - same as `bb.list`, but actually applies the role/nickname changes. Admin/leadership role required.",
+                        "`bb.lookup <tracker or ballchasing URL>` - resolves a player's linked platform accounts. Admin/leadership role required.",
+                        "`bb.if` - DMs the season intent form to every active player in the database. Bot owner only.",
+                        "`bb.nif` - posts the season intent form to the configured channel. Bot owner only.",
+                    ].join("\n"),
+                },
+            ],
+        });
+        return;
+    }
+
+    if (m.guild?.id !== "729343895720165377" && !ADMIN_IDS.includes(m.author.id)) return;
 
     if (
         (m.guild?.id === "729343895720165377" &&
-            m.author.id !== "105408136285818880" &&
+            !ADMIN_IDS.includes(m.author.id) &&
             m.member?.roles.cache.has("880757580622884864")) ||
-        m.author.id === "105408136285818880"
+        ADMIN_IDS.includes(m.author.id)
     ) {
         if (m.content === "bb.fix" || m.content === "bb.list") {
             const server = await discordClient.guilds.fetch("172404472637685760");
@@ -150,6 +187,12 @@ discordClient.on(Events.MessageCreate, async m => {
 
             let totalAdds = 0;
             let totalRemoves = 0;
+
+            const outputLines: string[] = [];
+            const record = (msg: string) => {
+                console.log(msg);
+                outputLines.push(msg);
+            };
 
             const players = await pgClient.manyOrNone<{
                 id: number;
@@ -214,7 +257,7 @@ discordClient.on(Events.MessageCreate, async m => {
                                     /(^\w+\s\|\s[\w\s.\-_!+'?^:/\][;()<>,|óñ†™]+)(\s[❤️🖤💙🤎💚🧡💜🤍💛]*)?$/u,
                                 );
                                 if (!member.nickname) {
-                                    console.log(`\`${member.displayName}\` should be \`${db.callsign} | ${db.name}`);
+                                    record(`\`${member.displayName}\` should be \`${db.callsign} | ${db.name}`);
                                     if (doFix)
                                         await member
                                             .setNickname(`${db.callsign} | ${db.name}`)
@@ -223,7 +266,7 @@ discordClient.on(Events.MessageCreate, async m => {
                                     const [, nickname, hearts] = match;
 
                                     if (nickname !== `${db.callsign} | ${db.name}`) {
-                                        console.log(
+                                        record(
                                             `\`${member.nickname}\` should be \`${db.callsign} | ${db.name}${
                                                 hearts ? hearts : ""
                                             }\``,
@@ -242,7 +285,7 @@ discordClient.on(Events.MessageCreate, async m => {
                                         const [, nickname, hearts] = sMatch;
 
                                         if (nickname !== `${db.callsign} | ${db.name}`) {
-                                            console.log(
+                                            record(
                                                 `\`${member.nickname}\` should be \`${db.callsign} | ${db.name}${
                                                     hearts ? hearts : ""
                                                 }\``,
@@ -268,7 +311,7 @@ discordClient.on(Events.MessageCreate, async m => {
                                 const [, nickname, hearts] = match;
 
                                 if (nickname !== db.name) {
-                                    console.log(
+                                    record(
                                         `\`${member.displayName}\` (${nickname}) should be \`${db.name}${
                                             hearts ? hearts : ""
                                         }\``,
@@ -298,10 +341,10 @@ discordClient.on(Events.MessageCreate, async m => {
                     totalAdds += toAdd.length;
                     totalRemoves += toRemove.length;
 
-                    let log = `${db?.name ?? member.displayName} (${member.id})`;
-                    if (toAdd.length) log += `\t||\tADD: ${toAdd.join(", ")}`;
-                    if (toRemove.length) log += `\t||\tREMOVE: ${toRemove.join(", ")}`;
-                    console.log(log);
+                    let line = `${db?.name ?? member.displayName} (${member.id})`;
+                    if (toAdd.length) line += `\t||\tADD: ${toAdd.join(", ")}`;
+                    if (toRemove.length) line += `\t||\tREMOVE: ${toRemove.join(", ")}`;
+                    record(line);
 
                     if (doFix) {
                         if (toAdd.length) {
@@ -318,8 +361,18 @@ discordClient.on(Events.MessageCreate, async m => {
                     console.error(err);
                 }
             }
-            console.log(`\n\nTotal roles to add: ${totalAdds}`);
-            console.log(`Total roles to remove: ${totalRemoves}`);
+            record(`\nTotal roles to add: ${totalAdds}`);
+            record(`Total roles to remove: ${totalRemoves}`);
+
+            const attachment = new AttachmentBuilder(
+                Buffer.from(outputLines.length ? outputLines.join("\n") : "No changes needed.", "utf-8"),
+                {name: `${doFix ? "bb-fix" : "bb-list"}-${Date.now()}.txt`},
+            );
+
+            await m.reply({
+                content: `${doFix ? "Applied" : "Would apply"} ${totalAdds} role add(s) and ${totalRemoves} role remove(s). Full diff attached.`,
+                files: [attachment],
+            });
 
             await m.react("✅");
         } else if (m.content.startsWith("bb.lookup")) {
@@ -415,7 +468,7 @@ discordClient.on(Events.MessageCreate, async m => {
                 );
             }
         } else if (m.content.startsWith("bb.if")) {
-            if (m.author.id !== "105408136285818880") return;
+            if (!ADMIN_IDS.includes(m.author.id)) return;
 
             // const dbRes = await pg.query<{id: number; mleid: number; name: string; discord_id: string}>(
             //     // Hyper, Hoos, TyTy, Olivia, Lack, DK
@@ -504,7 +557,7 @@ discordClient.on(Events.MessageCreate, async m => {
                 }
             }
         } else if (m.content === "bb.nif") {
-            if (m.author.id !== "105408136285818880") return;
+            if (!ADMIN_IDS.includes(m.author.id)) return;
 
             try {
                 const channel = await discordClient.channels.fetch("652687231974375426");
