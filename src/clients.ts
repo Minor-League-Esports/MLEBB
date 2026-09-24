@@ -21,8 +21,13 @@ const pgp = pgPromise();
 const certPath = "ca-certificate.crt";
 const ca = existsSync(certPath) ? readFileSync(certPath).toString() : undefined;
 
+// `sslmode` in the connection string makes `pg` derive its own SSL settings from the
+// string and ignore the `ssl` object below (silently dropping our custom `ca`), which
+// causes DO's self-signed project CA to fail against the default trust store instead.
+const connectionString = process.env.connstring?.replace(/[?&]sslmode=[^&]*/, "");
+
 export const pgClient = pgp({
-    connectionString: process.env.connstring,
+    connectionString,
     ssl: {
         rejectUnauthorized: true,
         ...(ca ? {ca} : {}),
