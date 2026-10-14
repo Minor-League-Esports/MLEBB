@@ -24,8 +24,9 @@ connstring=postgresql://user:password@host:port/sprocket_main?sslmode=require
 DB_SERVERNAME=your-db-servername.db.ondigitalocean.com
 ```
 
-The bot verifies its DB connection against `ca-certificate.crt` (DigiCert Global Root CA,
-committed in this repo) — Digital Ocean's managed Postgres requires SSL.
+The bot verifies its DB connection against `ca-certificate.crt` (the Digital Ocean cluster's
+project CA certificate, committed in this repo; download it from the DO dashboard under the
+database's Connection Details) — Digital Ocean's managed Postgres requires SSL.
 
 ### Discord application setup
 
