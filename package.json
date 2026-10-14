@@ -1,5 +1,6 @@
 {
     "main": "dist/index.js",
+    "type": "commonjs",
     "scripts": {
         "start": "tsc && node dist/index.js --require dotenv/config",
         "dev": "node-dev ./src/index.ts --notify=false --require dotenv/config"
