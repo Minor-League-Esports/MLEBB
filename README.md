@@ -22,6 +22,11 @@ connstring=postgresql://user:password@host:port/sprocket_main?sslmode=require
 
 # Optional: only needed if SSL hostname verification fails against the DO cluster
 DB_SERVERNAME=your-db-servername.db.ondigitalocean.com
+
+# Optional: comma-separated server IDs where bb.list/bb.fix may run (they act on the server
+# they're sent in; sending them in the staff server targets the main MLE server).
+# Defaults to just the main MLE server.
+ROLE_SYNC_GUILDS=172404472637685760,second_server_id,third_server_id
 ```
 
 The bot verifies its DB connection against `ca-certificate.crt` (the Digital Ocean cluster's

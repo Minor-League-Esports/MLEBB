@@ -4,14 +4,27 @@ config();
 
 import {compareAsc, format, parseISO} from "date-fns";
 import {utcToZonedTime, zonedTimeToUtc} from "date-fns-tz";
-import {AttachmentBuilder, ButtonStyle, ComponentType, Events} from "discord.js";
+import type {ButtonInteraction, GuildMember} from "discord.js";
+import {AttachmentBuilder, ButtonStyle, ComponentType, Events, PermissionFlagsBits} from "discord.js";
 
 import {discordClient, pgClient} from "./clients";
 import type {EpicProfile} from "./epic";
 import {bcToXboxId, EpicService, xboxIdToBC} from "./epic";
 import {sheets} from "./google";
-import {exclude, include} from "./roles";
+import {exclude, include, roles as roleNames} from "./roles";
+import {createThrottle} from "./throttle";
 import {RetentionOption, retentionOptions} from "./types";
+
+// Discord allows ~50 requests/sec globally per bot. Bulk jobs (bb.if DMs, bb.fix role/nickname
+// updates) share this throttle at half that, so even when they overlap there's headroom for
+// everything else the bot does (button replies, one-off commands).
+const BULK_CALLS_PER_SECOND = 25;
+const bulkThrottle = createThrottle(BULK_CALLS_PER_SECOND);
+
+async function setNicknameThrottled(member: GuildMember, nickname: string, name: string): Promise<void> {
+    await bulkThrottle();
+    await member.setNickname(nickname).catch(() => console.error(`Nickname change failed for ${name}`));
+}
 
 const ADMIN_IDS = [
     "105408136285818880",
@@ -21,10 +34,23 @@ const ADMIN_IDS = [
     "165656556568838144",
 ];
 
+const MLE_GUILD_ID = "172404472637685760";
+const STAFF_GUILD_ID = "729343895720165377";
+
+// Servers bb.list/bb.fix may run in (comma-separated guild IDs in .env). Defaults to just MLE.
+const ROLE_SYNC_GUILD_IDS = (process.env.ROLE_SYNC_GUILDS ?? MLE_GUILD_ID)
+    .split(",")
+    .map(id => id.trim())
+    .filter(Boolean);
+
 discordClient
     .login(process.env.TOKEN)
     .then(() => console.log("Client logged in"))
     .catch(err => console.error(err));
+
+// Node exits on unhandled promise rejections; log them instead so one failed Discord/Sheets/DB
+// call inside an event handler can't take the whole bot offline.
+process.on("unhandledRejection", e => console.error("Unhandled promise rejection", e));
 
 discordClient.on(Events.Error, e => console.error(e));
 
@@ -32,9 +58,33 @@ discordClient.on(Events.ClientReady, () => {
     console.log(`Connected to ${discordClient.user?.username}`);
 });
 
-discordClient.on(Events.InteractionCreate, async i => {
-    if (!i.isButton()) return;
+const INTENT_BUTTONS: string[] = [
+    RetentionOption.RETAINABLE,
+    RetentionOption.FA,
+    RetentionOption.FP,
+    RetentionOption.LASTRESPONSE,
+];
 
+discordClient.on(Events.InteractionCreate, async i => {
+    if (!i.isButton() || !INTENT_BUTTONS.includes(i.customId)) return;
+
+    try {
+        // Acknowledge immediately: Discord rejects replies sent more than 3s after the click,
+        // and the Sheets/DB calls in the handler can take longer than that under load.
+        await i.deferReply({ephemeral: true});
+        await handleIntentButton(i);
+    } catch (e) {
+        console.error(`Intent button ${i.customId} failed for ${i.user.id}`, e);
+        if (i.deferred)
+            await i
+                .editReply(
+                    "Something went wrong processing your click. Use **Get Last Response** to check whether it was saved, or try again.",
+                )
+                .catch(() => undefined);
+    }
+});
+
+async function handleIntentButton(i: ButtonInteraction): Promise<void> {
     if (i.customId === RetentionOption.LASTRESPONSE) {
         const allResponses = await sheets.spreadsheets.values.get({
             spreadsheetId: "1IqdwyiCy5YdAqkZpe_jf_P5MxGDl-DR-NaqHJZjjhtM",
@@ -48,29 +98,23 @@ discordClient.on(Events.InteractionCreate, async i => {
         const lastResponse = userResponses ? userResponses[userResponses.length - 1] : undefined;
 
         if (lastResponse) {
-            await i.reply({
+            await i.editReply({
                 content: `Your latest recorded response was submitted on ${format(
                     utcToZonedTime(parseISO(lastResponse[0]), "America/New_York"),
                     "MMMM do, u 'at' h:mmaaa 'ET",
                 )} as \`${retentionOptions[lastResponse[4]]}\`.`,
-                ephemeral: true,
             });
         } else {
-            await i.reply({
+            await i.editReply({
                 content: "Received no response.",
-                ephemeral: true,
             });
         }
         return;
     }
 
-    if (!([RetentionOption.FA, RetentionOption.FP, RetentionOption.RETAINABLE] as string[]).includes(i.customId))
-        return;
-
     if (compareAsc(new Date(), zonedTimeToUtc("2023-08-14T00:00:00.000", "America/New_York")) > 0) {
-        await i.reply({
+        await i.editReply({
             content: "The intent form is closed and responses can no longer be submitted.",
-            ephemeral: true,
         });
         return;
     }
@@ -86,17 +130,15 @@ discordClient.on(Events.InteractionCreate, async i => {
     ]);
 
     if (!player) {
-        await i.reply({
+        await i.editReply({
             content: "You are not a player in MLE.",
-            ephemeral: true,
         });
         return;
     }
 
     if (player.team_name === "FP") {
-        await i.reply({
+        await i.editReply({
             content: "Former players cannot submit an intent form.",
-            ephemeral: true,
         });
         return;
     }
@@ -110,12 +152,11 @@ discordClient.on(Events.InteractionCreate, async i => {
         },
     });
 
-    await i.reply({
+    await i.editReply({
         content: `Successfully recorded your response of \`${retentionOptions[i.customId]}\` on ${format(
             utcToZonedTime(new Date(), "America/New_York"),
             "MMMM do, u 'at' h:mmaaa 'ET",
         )}`,
-        ephemeral: true,
     });
 
     console.log(
@@ -135,7 +176,7 @@ discordClient.on(Events.InteractionCreate, async i => {
     } catch (e) {
         console.error(e);
     }
-});
+}
 
 discordClient.on(Events.MessageCreate, async m => {
     if (m.author.bot || m.channel.isDMBased()) return;
@@ -154,7 +195,7 @@ discordClient.on(Events.MessageCreate, async m => {
                     color: 0xeec707,
                     title: "MLEBB Commands",
                     description: [
-                        "`bb.ping` - health check, replies \"pong\". No permissions required.",
+                        '`bb.ping` - health check, replies "pong". No permissions required.',
                         "`bb.help` - shows this list. No permissions required.",
                         "`bb.list` - reports role/nickname changes that would be made, without applying them. Admin/leadership role required.",
                         "`bb.fix` - same as `bb.list`, but actually applies the role/nickname changes. Admin/leadership role required.",
@@ -168,17 +209,29 @@ discordClient.on(Events.MessageCreate, async m => {
         return;
     }
 
-    if (m.guild?.id !== "729343895720165377" && !ADMIN_IDS.includes(m.author.id)) return;
+    const isAdmin = ADMIN_IDS.includes(m.author.id);
+    const isStaffLeader = m.guild?.id === STAFF_GUILD_ID && m.member?.roles.cache.has("880757580622884864");
+    const isRoleSyncCommand = m.content === "bb.fix" || m.content === "bb.list";
+    // Members who can already manage roles in an enabled server may run bb.list/bb.fix there.
+    const canRoleSyncHere =
+        isRoleSyncCommand &&
+        ROLE_SYNC_GUILD_IDS.includes(m.guild!.id) &&
+        !!m.member?.permissions.has(PermissionFlagsBits.ManageRoles);
 
-    if (
-        (m.guild?.id === "729343895720165377" &&
-            !ADMIN_IDS.includes(m.author.id) &&
-            m.member?.roles.cache.has("880757580622884864")) ||
-        ADMIN_IDS.includes(m.author.id)
-    ) {
-        if (m.content === "bb.fix" || m.content === "bb.list") {
-            const server = await discordClient.guilds.fetch("172404472637685760");
+    if (isAdmin || isStaffLeader || canRoleSyncHere) {
+        if (isRoleSyncCommand) {
+            // The staff server manages the main MLE server; anywhere else, operate on the server the command was sent in.
+            const server =
+                m.guild!.id === STAFF_GUILD_ID ? await discordClient.guilds.fetch(MLE_GUILD_ID) : m.guild!;
+            if (!ROLE_SYNC_GUILD_IDS.includes(server.id)) {
+                await m.reply(
+                    `bb.list/bb.fix isn't enabled for this server. Add \`${server.id}\` to ROLE_SYNC_GUILDS in .env.`,
+                );
+                return;
+            }
             await server.members.fetch();
+            await server.roles.fetch();
+            console.log(`Target server: ${server.name} (${server.id})`);
 
             await m.react("<a:loading:827379552392577024>");
 
@@ -193,6 +246,10 @@ discordClient.on(Events.MessageCreate, async m => {
                 console.log(msg);
                 outputLines.push(msg);
             };
+
+            record(`Server: ${server.name} (${server.id})`);
+            const missingRoles = Object.values(roleNames).filter(r => !server.roles.cache.some(sr => sr.name === r));
+            if (missingRoles.length) record(`Roles missing from this server (skipped): ${missingRoles.join(", ")}\n`);
 
             const players = await pgClient.manyOrNone<{
                 id: number;
@@ -259,9 +316,7 @@ discordClient.on(Events.MessageCreate, async m => {
                                 if (!member.nickname) {
                                     record(`\`${member.displayName}\` should be \`${db.callsign} | ${db.name}`);
                                     if (doFix)
-                                        await member
-                                            .setNickname(`${db.callsign} | ${db.name}`)
-                                            .catch(() => console.error(`Nickname change failed for ${db.name}`));
+                                        await setNicknameThrottled(member, `${db.callsign} | ${db.name}`, db.name);
                                 } else if (match) {
                                     const [, nickname, hearts] = match;
 
@@ -272,9 +327,11 @@ discordClient.on(Events.MessageCreate, async m => {
                                             }\``,
                                         );
                                         if (doFix)
-                                            await member
-                                                .setNickname(`${db.callsign} | ${db.name}${hearts ? hearts : ""}`)
-                                                .catch(() => console.error(`Nickname change failed for ${db.name}`));
+                                            await setNicknameThrottled(
+                                                member,
+                                                `${db.callsign} | ${db.name}${hearts ? hearts : ""}`,
+                                                db.name,
+                                            );
                                     }
                                 } else {
                                     const sMatch = member.displayName.match(
@@ -291,11 +348,11 @@ discordClient.on(Events.MessageCreate, async m => {
                                                 }\``,
                                             );
                                             if (doFix)
-                                                await member
-                                                    .setNickname(`${db.callsign} | ${db.name}${hearts ? hearts : ""}`)
-                                                    .catch(() =>
-                                                        console.error(`Nickname change failed for ${db.name}`),
-                                                    );
+                                                await setNicknameThrottled(
+                                                    member,
+                                                    `${db.callsign} | ${db.name}${hearts ? hearts : ""}`,
+                                                    db.name,
+                                                );
                                         }
                                     } else {
                                         console.error(`Failed to match with ${db.name} (${member.displayName}) 2`);
@@ -317,9 +374,11 @@ discordClient.on(Events.MessageCreate, async m => {
                                         }\``,
                                     );
                                     if (doFix)
-                                        await member
-                                            .setNickname(`${db.name}${hearts ? hearts : ""}`)
-                                            .catch(() => console.error(`Nickname change failed for ${db.name}`));
+                                        await setNicknameThrottled(
+                                            member,
+                                            `${db.name}${hearts ? hearts : ""}`,
+                                            db.name,
+                                        );
                                 }
                             } else {
                                 console.error(`Failed to match with ${db.name} (${member.displayName}) 3`);
@@ -333,7 +392,8 @@ discordClient.on(Events.MessageCreate, async m => {
                     const have = include(shouldHave);
                     const nothave = exclude(shouldHave).filter(r => roles.includes(r));
 
-                    const toAdd = have.filter(r => !roles.includes(r));
+                    // Skip roles this server doesn't have, otherwise roles.add() fails for the whole member.
+                    const toAdd = have.filter(r => !roles.includes(r) && server.roles.cache.some(sr => sr.name === r));
                     const toRemove = nothave;
 
                     if (!toAdd.length && !toRemove.length) continue;
@@ -349,11 +409,13 @@ discordClient.on(Events.MessageCreate, async m => {
                     if (doFix) {
                         if (toAdd.length) {
                             const toAddRoles = toAdd.map(r => server.roles.cache.find(sr => sr.name === r)!);
+                            await bulkThrottle();
                             await member.roles.add(toAddRoles);
                         }
 
                         if (toRemove.length) {
                             const toRemoveRoles = toRemove.map(r => server.roles.cache.find(sr => sr.name === r)!);
+                            await bulkThrottle();
                             await member.roles.remove(toRemoveRoles);
                         }
                     }
@@ -370,7 +432,9 @@ discordClient.on(Events.MessageCreate, async m => {
             );
 
             await m.reply({
-                content: `${doFix ? "Applied" : "Would apply"} ${totalAdds} role add(s) and ${totalRemoves} role remove(s). Full diff attached.`,
+                content: `${
+                    doFix ? "Applied" : "Would apply"
+                } ${totalAdds} role add(s) and ${totalRemoves} role remove(s). Full diff attached.`,
                 files: [attachment],
             });
 
@@ -490,10 +554,17 @@ discordClient.on(Events.MessageCreate, async m => {
 
             for (const row of players) {
                 try {
+                    if (!discordClient.users.cache.has(row.discord_id)) await bulkThrottle();
                     const user = await discordClient.users.fetch(row.discord_id);
 
                     if (user.dmChannel?.lastMessage?.author.id === "1108218757853233273") continue;
 
+                    // Open the DM channel separately so each API call gets its own throttle slot.
+                    if (!user.dmChannel) {
+                        await bulkThrottle();
+                        await user.createDM();
+                    }
+                    await bulkThrottle();
                     await user
                         .send({
                             embeds: [
