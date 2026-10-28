@@ -5,13 +5,13 @@ config();
 import {compareAsc, format, parseISO} from "date-fns";
 import {utcToZonedTime, zonedTimeToUtc} from "date-fns-tz";
 import type {ButtonInteraction, GuildMember} from "discord.js";
-import {AttachmentBuilder, ButtonStyle, ComponentType, Events} from "discord.js";
+import {AttachmentBuilder, ButtonStyle, ComponentType, Events, PermissionFlagsBits} from "discord.js";
 
 import {discordClient, pgClient} from "./clients";
 import type {EpicProfile} from "./epic";
 import {bcToXboxId, EpicService, xboxIdToBC} from "./epic";
 import {sheets} from "./google";
-import {exclude, include} from "./roles";
+import {exclude, include, roles as roleNames} from "./roles";
 import {createThrottle} from "./throttle";
 import {RetentionOption, retentionOptions} from "./types";
 
@@ -33,6 +33,15 @@ const ADMIN_IDS = [
     "765878889150283776",
     "165656556568838144",
 ];
+
+const MLE_GUILD_ID = "172404472637685760";
+const STAFF_GUILD_ID = "729343895720165377";
+
+// Servers bb.list/bb.fix may run in (comma-separated guild IDs in .env). Defaults to just MLE.
+const ROLE_SYNC_GUILD_IDS = (process.env.ROLE_SYNC_GUILDS ?? MLE_GUILD_ID)
+    .split(",")
+    .map(id => id.trim())
+    .filter(Boolean);
 
 discordClient
     .login(process.env.TOKEN)
@@ -200,17 +209,29 @@ discordClient.on(Events.MessageCreate, async m => {
         return;
     }
 
-    if (m.guild?.id !== "729343895720165377" && !ADMIN_IDS.includes(m.author.id)) return;
+    const isAdmin = ADMIN_IDS.includes(m.author.id);
+    const isStaffLeader = m.guild?.id === STAFF_GUILD_ID && m.member?.roles.cache.has("880757580622884864");
+    const isRoleSyncCommand = m.content === "bb.fix" || m.content === "bb.list";
+    // Members who can already manage roles in an enabled server may run bb.list/bb.fix there.
+    const canRoleSyncHere =
+        isRoleSyncCommand &&
+        ROLE_SYNC_GUILD_IDS.includes(m.guild!.id) &&
+        !!m.member?.permissions.has(PermissionFlagsBits.ManageRoles);
 
-    if (
-        (m.guild?.id === "729343895720165377" &&
-            !ADMIN_IDS.includes(m.author.id) &&
-            m.member?.roles.cache.has("880757580622884864")) ||
-        ADMIN_IDS.includes(m.author.id)
-    ) {
-        if (m.content === "bb.fix" || m.content === "bb.list") {
-            const server = await discordClient.guilds.fetch("172404472637685760");
+    if (isAdmin || isStaffLeader || canRoleSyncHere) {
+        if (isRoleSyncCommand) {
+            // The staff server manages the main MLE server; anywhere else, operate on the server the command was sent in.
+            const server =
+                m.guild!.id === STAFF_GUILD_ID ? await discordClient.guilds.fetch(MLE_GUILD_ID) : m.guild!;
+            if (!ROLE_SYNC_GUILD_IDS.includes(server.id)) {
+                await m.reply(
+                    `bb.list/bb.fix isn't enabled for this server. Add \`${server.id}\` to ROLE_SYNC_GUILDS in .env.`,
+                );
+                return;
+            }
             await server.members.fetch();
+            await server.roles.fetch();
+            console.log(`Target server: ${server.name} (${server.id})`);
 
             await m.react("<a:loading:827379552392577024>");
 
@@ -225,6 +246,10 @@ discordClient.on(Events.MessageCreate, async m => {
                 console.log(msg);
                 outputLines.push(msg);
             };
+
+            record(`Server: ${server.name} (${server.id})`);
+            const missingRoles = Object.values(roleNames).filter(r => !server.roles.cache.some(sr => sr.name === r));
+            if (missingRoles.length) record(`Roles missing from this server (skipped): ${missingRoles.join(", ")}\n`);
 
             const players = await pgClient.manyOrNone<{
                 id: number;
@@ -367,7 +392,8 @@ discordClient.on(Events.MessageCreate, async m => {
                     const have = include(shouldHave);
                     const nothave = exclude(shouldHave).filter(r => roles.includes(r));
 
-                    const toAdd = have.filter(r => !roles.includes(r));
+                    // Skip roles this server doesn't have, otherwise roles.add() fails for the whole member.
+                    const toAdd = have.filter(r => !roles.includes(r) && server.roles.cache.some(sr => sr.name === r));
                     const toRemove = nothave;
 
                     if (!toAdd.length && !toRemove.length) continue;
